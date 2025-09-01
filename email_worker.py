@@ -390,7 +390,15 @@ def list_attachments(msg_id: str, token: str) -> List[Dict[str, Any]]:
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"attachments: {r.status_code} {r.text}")
-        return r.json().get("value", [])
+        items = r.json().get("value", [])
+        # Filter out reference/item attachments; accept only fileAttachment
+        out = []
+        for a in items:
+            otype = a.get("@odata.type", "")
+            if "fileAttachment" in otype:
+                out.append(a)
+        log(f"[attach] found {len(out)} file attachments out of {len(items)} total")
+        return out
     return _retry_with_backoff(_make_request)
 
 def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, Any]:
@@ -447,8 +455,14 @@ def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=Tru
     
     def _patch_draft(draft_id: str):
         patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
-        # Simpler approach: set our reply body only; Graph keeps the quoted history automatically
-        payload = {"body": {"contentType": "HTML", "content": html_body or ""}}
+        # Fetch original message body to ensure thread is visible below our reply
+        try:
+            orig = fetch_message(msg_id, token) or {}
+            orig_html = (((orig.get("body") or {}).get("content") or ""))
+        except Exception:
+            orig_html = ""
+        combined_html = f"<div>{html_body or ''}</div>" + (f"<br>{orig_html}" if orig_html else "")
+        payload = {"body": {"contentType": "HTML", "content": combined_html}}
         r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"reply_patch: {r.status_code} {r.text}")
@@ -866,6 +880,10 @@ def run_worker_loop():
                 log(f"Found {len(msgs)} unread message(s).")
 
             for m in msgs or []:
+                # De-dupe: skip if already processed
+                mid = m.get("id")
+                if mid and mid in STATE.seen:
+                    continue
                 if not _sender_allowed(m):
                     # leave unread; skip completely
                     continue
