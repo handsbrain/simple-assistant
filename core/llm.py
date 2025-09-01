@@ -31,7 +31,6 @@ def ask_chatgpt(prompt: str, max_retries: int = 3) -> str:
                     {"role": "system", "content": "You are a helpful professional assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                max_completion_tokens=4000,  # Reasonable limit for responses
                 temperature=0.7,
             )
             
