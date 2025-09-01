@@ -579,7 +579,13 @@ def start_health_server():
                     u = urlparse(self.path)
                     qs = parse_qs(u.query or "")
                     q = (qs.get("q", [""])[0] or "").strip()
-                    limit = int(qs.get("limit", ["50"])[0])
+                    # Parse limit robustly (supports values like "50.") and clamp to sane range
+                    _raw_limit = (qs.get("limit", ["50"])[0] or "50").strip()
+                    try:
+                        limit = int(float(_raw_limit))
+                    except Exception:
+                        limit = 50
+                    limit = max(1, min(limit, 500))
                     kind = (qs.get("kind", [None])[0] or None)
                     tag_contains = (qs.get("tag_contains", [None])[0] or None)
 
