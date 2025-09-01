@@ -374,7 +374,7 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
             "$filter": "isRead eq false",
             "$orderby": "receivedDateTime desc",
             "$top": "10",
-            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments,conversationId",
+            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments",
         }
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
@@ -386,20 +386,11 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
 def list_attachments(msg_id: str, token: str) -> List[Dict[str, Any]]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments"
-        # Let Graph return default fields (including @odata.type); just cap results
-        params = {"$top": str(ATTACH_MAX_COUNT)}
+        params = {"$select": "id,name,contentType,size,isInline,@odata.type", "$top": str(ATTACH_MAX_COUNT)}
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"attachments: {r.status_code} {r.text}")
-        items = r.json().get("value", [])
-        # Filter out reference/item attachments; accept only fileAttachment
-        out = []
-        for a in items:
-            otype = a.get("@odata.type", "")
-            if ("fileAttachment" in otype) or (otype == ""):
-                out.append(a)
-        log(f"[attach] found {len(out)} file attachments out of {len(items)} total")
-        return out
+        return r.json().get("value", [])
     return _retry_with_backoff(_make_request)
 
 def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, Any]:
@@ -415,52 +406,18 @@ def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, An
             data = base64.b64decode(b64) if b64 else b""
         except Exception:
             data = b""
-        size = int(j.get("size") or 0)
-        # Fallback: if no inline contentBytes, download raw via $value (cap by ATTACH_MAX_MB)
-        if (not data) and size > 0:
-            val_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments/{att_id}/$value"
-            rv = _http.get(val_url, headers=_auth(token), timeout=60, stream=True)
-            if rv.status_code >= 400:
-                raise RuntimeError(f"attach_value: {rv.status_code} {rv.text}")
-            limit = ATTACH_MAX_MB * 1024 * 1024
-            buf = bytearray()
-            read = 0
-            for chunk in rv.iter_content(65536):
-                if not chunk:
-                    break
-                read += len(chunk)
-                if read > limit:
-                    # stop reading beyond limit
-                    break
-                buf.extend(chunk)
-            data = bytes(buf)
-        return {"name": j.get("name",""), "contentType": j.get("contentType",""), "size": size, "bytes": data}
+        return {"name": j.get("name",""), "contentType": j.get("contentType",""), "size": int(j.get("size") or 0), "bytes": data}
     return _retry_with_backoff(_make_request)
 
 def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
-        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body,conversationId"}
+        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body"}
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"fetch_message: {r.status_code} {r.text}")
         return r.json()
     
-    return _retry_with_backoff(_make_request)
-
-def list_messages_in_conversation(conversation_id: str, token: str, top: int = 10) -> List[Dict[str, Any]]:
-    def _make_request():
-        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages"
-        params = {
-            "$filter": f"conversationId eq '{conversation_id}'",
-            "$orderby": "receivedDateTime desc",
-            "$top": str(int(top)),
-            "$select": "id,receivedDateTime,hasAttachments"
-        }
-        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
-        if r.status_code >= 400:
-            raise RuntimeError(f"list_conv: {r.status_code} {r.text}")
-        return r.json().get("value", [])
     return _retry_with_backoff(_make_request)
 
 def mark_read(msg_id: str, token: str) -> None:
@@ -490,13 +447,14 @@ def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=Tru
     
     def _patch_draft(draft_id: str):
         patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
-        # Fetch original message body to ensure thread is visible below our reply
-        try:
-            orig = fetch_message(msg_id, token) or {}
-            orig_html = (((orig.get("body") or {}).get("content") or ""))
-        except Exception:
-            orig_html = ""
-        combined_html = f"<div>{html_body or ''}</div>" + (f"<br>{orig_html}" if orig_html else "")
+        # Fetch draft to capture quoted history content
+        get_url = patch_url + "?$select=body"
+        gr = _http.get(get_url, headers=_auth(token), timeout=30)
+        if gr.status_code >= 400:
+            raise RuntimeError(f"reply_fetch_draft: {gr.status_code} {gr.text}")
+        existing_html = (((gr.json() or {}).get("body") or {}).get("content") or "")
+        # Prepend our reply above the existing quoted thread
+        combined_html = f"<div>{html_body or ''}</div>" + (f"<br>{existing_html}" if existing_html else "")
         payload = {"body": {"contentType": "HTML", "content": combined_html}}
         r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
         if r.status_code >= 400:
@@ -591,46 +549,25 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
 
     # Attachments summary (non-TEACH path): include short snippets to help the model
     attach_block = ""
-    if ATTACH_ENABLE:
+    if ATTACH_ENABLE and (message.get("hasAttachments") or False):
         try:
             token = get_token()
-            # Collect attachments from the current message and, if empty, from recent messages in the same conversation
             atts = list_attachments(message.get("id"), token)
-            if not atts:
-                try:
-                    conv_id = (message.get("conversationId") or "")
-                except Exception:
-                    conv_id = ""
-                if conv_id:
-                    for mm in list_messages_in_conversation(conv_id, token, top=5):
-                        for a in list_attachments(mm.get("id"), token):
-                            atts.append(a)
             pieces = []
             total = 0
             for a in atts[:ATTACH_MAX_COUNT]:
-                name = a.get("name") or "attachment"
-                ctype = a.get("contentType") or ""
-                size = int(a.get("size") or 0)
-                inline = bool(a.get("isInline"))
-                if inline:
-                    log(f"[attach] skip inline: {name} size={size} type={ctype}")
-                    continue
+                if a.get("isInline"): continue
                 det = fetch_attachment_bytes(message.get("id"), a.get("id"), token)
-                data = det.get("bytes", b"")
-                if not data:
-                    log(f"[attach] empty bytes after fetch (maybe too large or restricted): {name} size={size} type={ctype}")
-                snippet = _extract_text_from_attachment(det.get("name",name), det.get("contentType",ctype), data)
+                snippet = _extract_text_from_attachment(det.get("name",""), det.get("contentType",""), det.get("bytes", b""))
                 if not snippet: continue
                 snippet = snippet.strip().replace("\r\n","\n")
                 if len(snippet) > 400: snippet = snippet[:400] + "…"
-                entry = f"- {name}: {snippet}"
+                entry = f"- {a.get('name','attachment')}: {snippet}"
                 pieces.append(entry)
                 total += len(entry)
                 if total >= ATTACH_SUMMARY_MAX_CHARS: break
             if pieces:
                 attach_block = "Attachments:\n" + "\n".join(pieces) + "\n\n"
-            else:
-                log("[attach] no usable attachments or extraction produced no text")
         except Exception as e:
             log(f"[WARN] attachment summary failed: {type(e).__name__}: {e}")
 
@@ -708,31 +645,21 @@ def maybe_handle_teach(m, token) -> bool:
             log(f"[WARN] failed to save TEACH body: {type(e).__name__}: {e}")
 
     # Save attachments if enabled
-    if ATTACH_ENABLE:
+    if ATTACH_ENABLE and (m.get("hasAttachments") or False):
         try:
             atts = list_attachments(m["id"], token)
-            if not atts:
-                # Scan recent messages in the same conversation for attachments
-                try:
-                    conv_id = (m.get("conversationId") or "")
-                except Exception:
-                    conv_id = ""
-                if conv_id:
-                    for mm in list_messages_in_conversation(conv_id, token, top=5):
-                        for a in list_attachments(mm.get("id"), token):
-                            atts.append(a)
             count = 0
             for a in atts[:ATTACH_MAX_COUNT]:
+                if a.get("isInline"):
+                    continue
                 name = a.get("name") or "attachment"
                 ctype = a.get("contentType") or ""
                 ext = _file_ext(name, ctype)
                 if ATTACH_EXTS and ext not in ATTACH_EXTS:
-                    log(f"[attach] skip ext not allowed: {name} ext={ext}")
                     continue
                 det = fetch_attachment_bytes(m["id"], a.get("id"), token)
                 txt = _extract_text_from_attachment(det.get("name", name), det.get("contentType", ctype), det.get("bytes", b""))
                 if not txt:
-                    log(f"[attach] no text extracted: {name} type={ctype}")
                     continue
                 try:
                     add_memory(text=txt, kind=kind, tags=(tags + ["attachment", f"file:{name}", f"ext:{ext}"]), author=sender, source="email-attachment")
@@ -875,6 +802,60 @@ def start_health_server():
                 except Exception as e:
                     msg = json.dumps({"error": f"memdump failed: {type(e).__name__}: {e}"}).encode("utf-8")
                     self._write(500, "application/json; charset=utf-8", msg)
+            elif self.path.startswith("/attachpreview"):
+                # Preview extracted text from attachments on a message (or newest unread)
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    tok = get_token()
+                    u = urlparse(self.path)
+                    qs = parse_qs(u.query or "")
+                    msg_id = (qs.get("msg_id", [""])[0] or "").strip()
+                    limit_chars = int((qs.get("limit", ["800"])[0] or "800").strip() or 800)
+                    limit_chars = max(100, min(limit_chars, 20000))
+                    # If no msg_id provided, use newest unread
+                    if not msg_id:
+                        unread = list_unread_messages(tok)
+                        if not unread:
+                            self._write(200, "application/json; charset=utf-8", json.dumps({"error": "no unread messages"}).encode("utf-8"))
+                            return
+                        msg_id = unread[0].get("id")
+                    # Collect attachments from message; if none, scan recent in conversation
+                    atts = list_attachments(msg_id, tok)
+                    if not atts:
+                        try:
+                            meta = fetch_message(msg_id, tok)
+                            conv = (meta.get("conversationId") or "")
+                        except Exception:
+                            conv = ""
+                        if conv:
+                            for mm in list_messages_in_conversation(conv, tok, top=5):
+                                atts.extend(list_attachments(mm.get("id"), tok))
+                    results = []
+                    for a in atts[:ATTACH_MAX_COUNT]:
+                        name = a.get("name") or "attachment"
+                        ctype = a.get("contentType") or ""
+                        # Only file attachments
+                        otype = a.get("@odata.type", "")
+                        if otype and "fileAttachment" not in otype:
+                            results.append({"name": name, "contentType": ctype, "note": "skipped non-file attachment"})
+                            continue
+                        det = fetch_attachment_bytes(msg_id, a.get("id"), tok)
+                        data = det.get("bytes", b"")
+                        preview = _extract_text_from_attachment(det.get("name", name), det.get("contentType", ctype), data)
+                        preview = (preview or "").strip()
+                        if len(preview) > limit_chars:
+                            preview = preview[:limit_chars] + "\n… [truncated]"
+                        results.append({
+                            "name": det.get("name", name),
+                            "contentType": det.get("contentType", ctype),
+                            "size": det.get("size"),
+                            "preview": preview,
+                        })
+                    payload = json.dumps({"message_id": msg_id, "count": len(results), "attachments": results}).encode("utf-8")
+                    self._write(200, "application/json; charset=utf-8", payload)
+                except Exception as e:
+                    msg = json.dumps({"error": f"attachpreview failed: {type(e).__name__}: {e}"}).encode("utf-8")
+                    self._write(500, "application/json; charset=utf-8", msg)
             elif self.path in ("/", "/index.html"):
                 html_doc = f"""<!doctype html>
 <html>
@@ -944,10 +925,6 @@ def run_worker_loop():
                 log(f"Found {len(msgs)} unread message(s).")
 
             for m in msgs or []:
-                # De-dupe: skip if already processed
-                mid = m.get("id")
-                if mid and mid in STATE.seen:
-                    continue
                 if not _sender_allowed(m):
                     # leave unread; skip completely
                     continue
