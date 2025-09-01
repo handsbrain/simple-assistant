@@ -374,7 +374,7 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
             "$filter": "isRead eq false",
             "$orderby": "receivedDateTime desc",
             "$top": "10",
-            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments",
+            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments,conversationId",
         }
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
