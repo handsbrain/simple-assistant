@@ -135,6 +135,7 @@ def _append_signature_html(body_text: str) -> str:
 # Env required: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_USER_ID
 import requests
 import time
+import threading as _threading
 from typing import Optional, Tuple
 
 MS_TENANT_ID    = os.getenv("MS_TENANT_ID", "")
@@ -150,6 +151,7 @@ _http.headers.update({"Accept": "application/json"})
 
 # Token cache with expiration
 _token_cache: Optional[Tuple[str, float]] = None  # (token, expires_at)
+_token_lock = _threading.Lock()
 TOKEN_BUFFER_SECONDS = 300  # Refresh token 5 minutes before expiration
 
 # Retry configuration
@@ -212,13 +214,14 @@ def get_token() -> str:
     global _token_cache
     
     # Check if we have a valid cached token
-    if _token_cache is not None:
-        token, expires_at = _token_cache
-        current_time = time.time()
-        if current_time < (expires_at - TOKEN_BUFFER_SECONDS):
-            return token
-        else:
-            log(f"Token expires in {expires_at - current_time:.0f}s, refreshing...")
+    with _token_lock:
+        if _token_cache is not None:
+            token, expires_at = _token_cache
+            current_time = time.time()
+            if current_time < (expires_at - TOKEN_BUFFER_SECONDS):
+                return token
+            else:
+                log(f"Token expires in {expires_at - current_time:.0f}s, refreshing...")
     
     # Get new token
     _require_env()
@@ -242,7 +245,8 @@ def get_token() -> str:
         # Cache the token with expiration time
         expires_in = response_data.get("expires_in", 3600)  # Default to 1 hour
         expires_at = time.time() + expires_in
-        _token_cache = (token, expires_at)
+        with _token_lock:
+            _token_cache = (token, expires_at)
         
         log(f"New token obtained, expires in {expires_in}s")
         return token
@@ -514,11 +518,11 @@ def start_health_server():
                     health_status = "degraded"
                     issues.append(f"token_error: {type(e).__name__}")
                 
-                # Check memory system
+                # Check memory system availability without embeddings
                 try:
-                    if _HAS_MEM:
-                        search_memory("test", k=1)
-                    else:
+                    if _HAS_MEM and callable(mem_all_stats):
+                        _ = mem_all_stats()
+                    elif not _HAS_MEM:
                         health_status = "degraded"
                         issues.append("memory_system_unavailable")
                 except Exception as e:
