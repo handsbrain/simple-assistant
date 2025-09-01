@@ -447,15 +447,8 @@ def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=Tru
     
     def _patch_draft(draft_id: str):
         patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
-        # Fetch draft to capture quoted history content
-        get_url = patch_url + "?$select=body"
-        gr = _http.get(get_url, headers=_auth(token), timeout=30)
-        if gr.status_code >= 400:
-            raise RuntimeError(f"reply_fetch_draft: {gr.status_code} {gr.text}")
-        existing_html = (((gr.json() or {}).get("body") or {}).get("content") or "")
-        # Prepend our reply above the existing quoted thread
-        combined_html = f"<div>{html_body or ''}</div>" + (f"<br>{existing_html}" if existing_html else "")
-        payload = {"body": {"contentType": "HTML", "content": combined_html}}
+        # Simpler approach: set our reply body only; Graph keeps the quoted history automatically
+        payload = {"body": {"contentType": "HTML", "content": html_body or ""}}
         r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"reply_patch: {r.status_code} {r.text}")
@@ -549,7 +542,7 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
 
     # Attachments summary (non-TEACH path): include short snippets to help the model
     attach_block = ""
-    if ATTACH_ENABLE and (message.get("hasAttachments") or False):
+    if ATTACH_ENABLE:
         try:
             token = get_token()
             atts = list_attachments(message.get("id"), token)
@@ -568,6 +561,8 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
                 if total >= ATTACH_SUMMARY_MAX_CHARS: break
             if pieces:
                 attach_block = "Attachments:\n" + "\n".join(pieces) + "\n\n"
+            else:
+                log("[attach] no usable attachments or extraction produced no text")
         except Exception as e:
             log(f"[WARN] attachment summary failed: {type(e).__name__}: {e}")
 
