@@ -38,8 +38,14 @@ STATE_PATH  = STATE_DIR / "processed.json"
 ATTACH_ENABLE     = os.getenv("ATTACH_ENABLE", "1").lower() in ("1","true","yes","y")
 ATTACH_MAX_COUNT  = int(os.getenv("ATTACH_MAX_COUNT", "50"))
 ATTACH_MAX_MB     = int(os.getenv("ATTACH_MAX_MB", "30"))
-ATTACH_EXTS       = {e.strip().lower() for e in (os.getenv("ATTACH_EXTS", "pdf,docx,pptx,xlsx,txt,csv").split(",")) if e.strip()}
+ATTACH_EXTS       = {e.strip().lower() for e in (os.getenv("ATTACH_EXTS", "pdf,docx,pptx,xlsx,txt,csv,png,jpg,jpeg,tiff,bmp,webp").split(",")) if e.strip()}
 ATTACH_SUMMARY_MAX_CHARS = int(os.getenv("ATTACH_SUMMARY_MAX_CHARS", "2000"))
+
+# OCR (Tesseract) options
+ATTACH_OCR        = os.getenv("ATTACH_OCR", "1").lower() in ("1","true","yes","y")
+OCR_PAGES_MAX     = int(os.getenv("ATTACH_OCR_PAGES_MAX", "10"))
+OCR_LANG          = os.getenv("ATTACH_OCR_LANG", "eng").strip() or "eng"
+OCR_DPI           = int(os.getenv("ATTACH_OCR_DPI", "200"))
 
 # -------- Utilities ----------
 def html_to_text(s: str) -> str:
@@ -129,7 +135,25 @@ def _extract_text_from_attachment(name: str, content_type: str, data: bytes) -> 
             import io
             from pypdf import PdfReader
             r = PdfReader(io.BytesIO(data))
-            return "\n".join((p.extract_text() or "") for p in r.pages)
+            pdf_text = "\n".join((p.extract_text() or "") for p in r.pages)
+            if pdf_text.strip():
+                return pdf_text
+            if ATTACH_OCR:
+                try:
+                    import io
+                    import pypdfium2 as pdfium
+                    from PIL import Image
+                    import pytesseract
+                    pdf = pdfium.PdfDocument(io.BytesIO(data))
+                    n = min(len(pdf), OCR_PAGES_MAX)
+                    out_lines = []
+                    for i in range(n):
+                        page = pdf[i]
+                        pil_img = page.render(scale=OCR_DPI / 72.0).to_pil()
+                        out_lines.append(pytesseract.image_to_string(pil_img, lang=OCR_LANG))
+                    return "\n".join(out_lines)
+                except Exception:
+                    return ""
         if ext == "docx":
             import io
             from docx import Document
@@ -160,7 +184,16 @@ def _extract_text_from_attachment(name: str, content_type: str, data: bytes) -> 
             return "\n".join(out)
         if ext in ("csv", "txt", "json", "md"):
             return _safe_decode_text(data)
-        # Unsupported → skip (images/others)
+        if ext in ("png", "jpg", "jpeg", "tiff", "bmp", "webp"):
+            if not ATTACH_OCR:
+                return ""
+            try:
+                from PIL import Image
+                import io, pytesseract
+                img = Image.open(io.BytesIO(data))
+                return pytesseract.image_to_string(img, lang=OCR_LANG)
+            except Exception:
+                return ""
         return ""
     except Exception:
         return ""
