@@ -583,13 +583,22 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
             pieces = []
             total = 0
             for a in atts[:ATTACH_MAX_COUNT]:
-                if a.get("isInline"): continue
+                name = a.get("name") or "attachment"
+                ctype = a.get("contentType") or ""
+                size = int(a.get("size") or 0)
+                inline = bool(a.get("isInline"))
+                if inline:
+                    log(f"[attach] skip inline: {name} size={size} type={ctype}")
+                    continue
                 det = fetch_attachment_bytes(message.get("id"), a.get("id"), token)
-                snippet = _extract_text_from_attachment(det.get("name",""), det.get("contentType",""), det.get("bytes", b""))
+                data = det.get("bytes", b"")
+                if not data:
+                    log(f"[attach] empty bytes after fetch (maybe too large or restricted): {name} size={size} type={ctype}")
+                snippet = _extract_text_from_attachment(det.get("name",name), det.get("contentType",ctype), data)
                 if not snippet: continue
                 snippet = snippet.strip().replace("\r\n","\n")
                 if len(snippet) > 400: snippet = snippet[:400] + "…"
-                entry = f"- {a.get('name','attachment')}: {snippet}"
+                entry = f"- {name}: {snippet}"
                 pieces.append(entry)
                 total += len(entry)
                 if total >= ATTACH_SUMMARY_MAX_CHARS: break
@@ -674,21 +683,21 @@ def maybe_handle_teach(m, token) -> bool:
             log(f"[WARN] failed to save TEACH body: {type(e).__name__}: {e}")
 
     # Save attachments if enabled
-    if ATTACH_ENABLE and (m.get("hasAttachments") or False):
+    if ATTACH_ENABLE and (m.get("hasAttachments") or True):
         try:
             atts = list_attachments(m["id"], token)
             count = 0
             for a in atts[:ATTACH_MAX_COUNT]:
-                if a.get("isInline"):
-                    continue
                 name = a.get("name") or "attachment"
                 ctype = a.get("contentType") or ""
                 ext = _file_ext(name, ctype)
                 if ATTACH_EXTS and ext not in ATTACH_EXTS:
+                    log(f"[attach] skip ext not allowed: {name} ext={ext}")
                     continue
                 det = fetch_attachment_bytes(m["id"], a.get("id"), token)
                 txt = _extract_text_from_attachment(det.get("name", name), det.get("contentType", ctype), det.get("bytes", b""))
                 if not txt:
+                    log(f"[attach] no text extracted: {name} type={ctype}")
                     continue
                 try:
                     add_memory(text=txt, kind=kind, tags=(tags + ["attachment", f"file:{name}", f"ext:{ext}"]), author=sender, source="email-attachment")
