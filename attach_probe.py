@@ -64,7 +64,6 @@ def fetch_attachment(tok: str, msg_id: str, att_id: str):
     r = S.get(
         f"{GRAPH}/users/{USER}/messages/{msg_id}/attachments/{att_id}",
         headers=H(tok),
-        params={"$select": "name,contentType,size,contentBytes"},
         timeout=30,
     )
     r.raise_for_status()
