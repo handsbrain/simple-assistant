@@ -1,0 +1,19 @@
+# Python / editor junk
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# Git
+.git
+.gitignore
+
+# Secrets (never send to build context)
+.env
+.env.*
+!.env.sample      # keep a safe template if you have one
+!.env.example
+
+# Local state (mounted as volume at runtime)
+state/*
+!state/.gitkeep

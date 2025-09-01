@@ -1,0 +1,527 @@
+# email_worker.py
+from __future__ import annotations
+import os, sys, time, json, signal, threading, re, html, random
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
+
+# -------- Vector memory ----------
+from core.vector_mem import add_memory, search_memory, all_stats
+try:
+    from core.vector_mem import all_stats as mem_all_stats
+    _HAS_MEM = True
+except Exception:
+    mem_all_stats = None
+    _HAS_MEM = False
+
+# -------- LLM ----------
+from core.llm import ask_chatgpt
+
+# -------- Config ----------
+POLL_SECONDS      = int(os.getenv("POLL_SECONDS", "20"))
+DRY_RUN           = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes", "y")
+HEALTH_PORT       = int(os.getenv("HEALTH_PORT", "8080"))
+MAX_PROMPT_CHARS  = int(os.getenv("MAX_PROMPT_CHARS", "20000"))
+SIGNATURE_ENV     = os.getenv("ASSISTANT_SIGNATURE", "")          # optional
+SIGNATURE_FILE    = os.getenv("ASSISTANT_SIGNATURE_FILE", "")     # optional (path)
+
+# Allowlist (email or bare domain like example.com)
+_raw_allow = [x.strip().lower() for x in os.getenv("ALLOWLIST_SENDERS", "").split(",") if x.strip()]
+ALLOWLIST_EMAILS  = {a for a in _raw_allow if "@" in a}
+ALLOWLIST_DOMAINS = {a.split("@",1)[1] for a in _raw_allow if "@" in a} | {a for a in _raw_allow if "@" not in a}
+
+STATE_DIR   = Path(os.getenv("STATE_DIR", "state"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_PATH  = STATE_DIR / "processed.json"
+
+# -------- Utilities ----------
+def html_to_text(s: str) -> str:
+    s = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", s or "")
+    s = re.sub(r"(?is)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?is)</p>", "\n\n", s)
+    s = re.sub(r"(?is)<.*?>", "", s)
+    return html.unescape(s)
+
+def _strip_subject_lines(s: str) -> str:
+    # Remove any leading "Subject:" line the model might generate
+    lines = (s or "").splitlines()
+    out = []
+    for i, L in enumerate(lines):
+        if i == 0 and re.match(r"(?i)^\s*subject\s*:", L):
+            continue
+        out.append(L)
+    return "\n".join(out).strip()
+
+def _strip_llm_signature(s: str) -> str:
+    # Heuristic: drop a trailing short sign-off like "Best," on a single line
+    s = s.rstrip()
+    tail = s.splitlines()[-1].strip().lower() if s else ""
+    if tail in {"best", "best,", "thanks", "thanks,", "regards", "regards,"}:
+        return "\n".join(s.splitlines()[:-1]).rstrip()
+    return s
+
+def _text_to_html(s: str) -> str:
+    # Normalize CRLF → LF, escape, then convert LF to <br>
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    esc = html.escape(s, quote=False)
+    return esc.replace("\n", "<br>")
+
+def _load_signature() -> str:
+    # Prefer file if provided; else env
+    if SIGNATURE_FILE:
+        p = Path(SIGNATURE_FILE)
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    return SIGNATURE_ENV or ""
+
+SIGNATURE_RAW = _load_signature().strip()
+
+def _append_signature_html(body_text: str) -> str:
+    """
+    Build final HTML body:
+      <div>body…</div>
+      <hr>
+      <div>signature…</div>
+    """
+    if not body_text:
+        body_text = ""
+    body_text = _strip_subject_lines(body_text)
+    body_text = _strip_llm_signature(body_text)
+
+    body_html = _text_to_html(body_text).strip()
+
+    if not SIGNATURE_RAW:
+        return f"<div>{body_html}</div>"
+
+    sig_html = _text_to_html(SIGNATURE_RAW.strip())
+    sep = '<hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">'
+    return f"<div>{body_html}</div>{sep}<div>{sig_html}</div>"
+
+# -------- Microsoft Graph (Application permissions) ----------
+# Env required: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_USER_ID
+import requests
+
+MS_TENANT_ID    = os.getenv("MS_TENANT_ID", "")
+MS_CLIENT_ID    = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET= os.getenv("MS_CLIENT_SECRET", "")
+MS_USER_ID      = os.getenv("MS_USER_ID", "")  # target mailbox (email or GUID)
+
+GRAPH_TOKEN_URL = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
+GRAPH_BASE      = "https://graph.microsoft.com/v1.0"
+
+_http = requests.Session()
+_http.headers.update({"Accept": "application/json"})
+
+def _require_env():
+    missing = [k for k, v in {
+        "MS_TENANT_ID": MS_TENANT_ID,
+        "MS_CLIENT_ID": MS_CLIENT_ID,
+        "MS_CLIENT_SECRET": MS_CLIENT_SECRET,
+        "MS_USER_ID": MS_USER_ID,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing required env: {', '.join(missing)}")
+
+def get_token() -> str:
+    _require_env()
+    data = {
+        "client_id": MS_CLIENT_ID,
+        "client_secret": MS_CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+    r = _http.post(GRAPH_TOKEN_URL, data=data, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"token: {r.status_code} {r.text}")
+    tok = r.json().get("access_token")
+    if not tok:
+        raise RuntimeError("token: missing access_token")
+    return tok
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+def list_unread_messages(token: str) -> List[Dict[str, Any]]:
+    url = f"{GRAPH_BASE}/users/{MS_USER_ID}/mailFolders/Inbox/messages"
+    params = {
+        "$filter": "isRead eq false",
+        "$orderby": "receivedDateTime desc",
+        "$top": "10",
+        "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments",
+    }
+    r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"list_unread: {r.status_code} {r.text}")
+    return r.json().get("value", [])
+
+def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
+    url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
+    params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body"}
+    r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"fetch_message: {r.status_code} {r.text}")
+    return r.json()
+
+def mark_read(msg_id: str, token: str) -> None:
+    url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
+    payload = {"isRead": True}
+    r = _http.patch(url, headers=_auth(token), json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"mark_read: {r.status_code} {r.text}")
+
+def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=True) -> None:
+    """
+    Keep the thread by using the 'reply draft' flow:
+      POST   /users/{id}/messages/{msg_id}/createReply[All]
+      PATCH  /users/{id}/messages/{draft_id}   (body.contentType='HTML', body.content=html)
+      POST   /users/{id}/messages/{draft_id}/send
+    """
+    base = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
+    # 1) Create reply draft
+    create_url = base + ("/createReplyAll" if reply_all else "/createReply")
+    r = _http.post(create_url, headers=_auth(token), timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"reply_create: {r.status_code} {r.text}")
+    draft = r.json() or {}
+    draft_id = draft.get("id")
+    if not draft_id:
+        # Some Graph responses omit body; fetch the most recent draft in thread (fallback)
+        raise RuntimeError("reply_create: missing draft id in response")
+
+    # 2) Patch HTML body
+    patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
+    payload = {"body": {"contentType": "HTML", "content": html_body or ""}}
+    r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"reply_patch: {r.status_code} {r.text}")
+
+    # 3) Send
+    send_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}/send"
+    r = _http.post(send_url, headers=_auth(token), timeout=30)
+    if r.status_code not in (202, 204):
+        # Graph sometimes returns 202/204 on success
+        raise RuntimeError(f"reply_send: {r.status_code} {r.text}")
+
+# -------- State (de-dupe) ----------
+class State:
+    def __init__(self, path: Path):
+        self.path = path
+        self.seen: set[str] = set()
+        self.total_replied = 0
+        self.last_error: Optional[str] = None
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                self.seen = set(data.get("seen", []))
+                self.total_replied = int(data.get("total_replied", 0))
+                self.last_error = data.get("last_error")
+            except Exception:
+                pass
+
+    def save(self):
+        try:
+            self.path.write_text(json.dumps({
+                "seen": sorted(self.seen),
+                "total_replied": self.total_replied,
+                "last_error": self.last_error,
+            }))
+        except Exception:
+            pass
+
+STATE = State(STATE_PATH)
+
+# -------- Prompt builder ----------
+def build_prompt_with_memory(message: Dict[str, Any]) -> str:
+    sender = (((message.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+    subject = (message.get("subject") or "").strip()
+    body_html = (message.get("body") or {}).get("content") or ""
+    if (message.get("body") or {}).get("contentType","").lower() == "html":
+        body = html_to_text(body_html)
+    else:
+        body = body_html or (message.get("bodyPreview") or "")
+
+    # semantic pulls with light filters
+    snippets = []
+    try:
+        snippets = search_memory(query=f"{subject}\n{body[:500]}", k=6, where=None)
+    except Exception as e:
+        STATE.last_error = f"memory search failed: {e}"
+
+    memory_block = ""
+    if snippets:
+        lines = []
+        for s in snippets[:6]:
+            meta = s.get("meta") or {}
+            tag_str = meta.get("tags") or ""
+            kind = meta.get("kind") or "note"
+            lines.append(f"- ({kind}; tags={tag_str}) {s.get('text','')}")
+        memory_block = "Relevant internal notes:\n" + "\n".join(lines) + "\n\n"
+
+    # IMPORTANT: tell the model not to generate its own Subject or signature.
+    prompt = f"""You are an email assistant. Write a helpful, concise reply to the email below.
+
+Guidelines:
+- Write only the email body. Do NOT include a Subject line.
+- Do NOT include a full signature block; I'll append mine automatically.
+- Keep it professional and brief unless the sender explicitly asks for detail.
+
+{memory_block}Incoming email (from {sender}) — SUBJECT: {subject}
+
+Email body:
+{body}
+"""
+    if len(prompt) > MAX_PROMPT_CHARS:
+        prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[truncated]"
+    return prompt
+
+# -------- [TEACH] path ----------
+def maybe_handle_teach(m, token) -> bool:
+    subj = (m.get("subject") or "").strip()
+    if not subj.lower().startswith("[teach]"):
+        return False
+
+    sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+    body = (m.get("body") or {}).get("content") or m.get("bodyPreview") or ""
+    if (m.get("body") or {}).get("contentType","").lower() == "html":
+        body = html_to_text(body)
+
+    kind = "rule"
+    tags = []
+    parsed_text = None
+    for line in body.splitlines():
+        L = line.strip()
+        up = L.upper()
+        if up.startswith("KIND:"):
+            kind = L.split(":",1)[1].strip().lower() or "rule"
+        elif up.startswith("TAGS:"):
+            tags = [t.strip() for t in L.split(":",1)[1].split(",") if t.strip()]
+        elif up.startswith("TEXT:"):
+            parsed_text = L.split(":",1)[1].strip()
+
+    text_to_store = parsed_text or body.strip()
+    if not text_to_store:
+        reply_in_thread(m["id"], _append_signature_html("I didn't find any content to learn."), token)
+        mark_read(m["id"], token)
+        return True
+
+    try:
+        add_memory(text=text_to_store, kind=kind, tags=tags, author=sender, source="email")
+        reply_in_thread(m["id"], _append_signature_html("Thanks — I’ve saved this to my memory."), token)
+    except Exception as e:
+        reply_in_thread(m["id"], _append_signature_html(f"Sorry — I couldn’t save this to memory: {type(e).__name__}: {e}"), token)
+    finally:
+        mark_read(m["id"], token)
+    return True
+
+# -------- Logging & signals ----------
+def log(*args, **kwargs):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(ts, *args, flush=True, **kwargs)
+
+_STOP = False
+def _sig_handler(signum, frame):
+    global _STOP
+    _STOP = True
+
+# -------- Health server ----------
+_httpd = None
+def start_health_server():
+    import http.server
+    from http.server import ThreadingHTTPServer
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _write(self, code: int, ctype: str, payload: bytes):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            if self.path == "/health":
+                body = json.dumps({
+                    "status": "ok",
+                    "now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "dry_run": DRY_RUN,
+                    "total_replied": STATE.total_replied,
+                    "processed_cache": len(STATE.seen),
+                    "last_error": STATE.last_error,
+                    "poll_seconds": POLL_SECONDS,
+                }).encode("utf-8")
+                self._write(200, "application/json; charset=utf-8", body)
+            elif self.path == "/memstats":
+                if _HAS_MEM and callable(mem_all_stats):
+                    try:
+                        payload = json.dumps(mem_all_stats()).encode("utf-8")
+                        self._write(200, "application/json; charset=utf-8", payload)
+                    except Exception as e:
+                        msg = json.dumps({"error": f"memstats failed: {type(e).__name__}: {e}"}).encode("utf-8")
+                        self._write(500, "application/json; charset=utf-8", msg)
+                else:
+                    msg = json.dumps({"error": "memory module not available"}).encode("utf-8")
+                    self._write(501, "application/json; charset=utf-8", msg)
+            elif self.path.startswith("/memdump"):
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    if not _HAS_MEM:
+                        msg = json.dumps({"error": "memory module not available"}).encode("utf-8")
+                        self._write(501, "application/json; charset=utf-8", msg)
+                        return
+                    u = urlparse(self.path)
+                    qs = parse_qs(u.query or "")
+                    q = (qs.get("q", [""])[0] or "").strip()
+                    limit = int(qs.get("limit", ["50"])[0])
+                    kind = (qs.get("kind", [None])[0] or None)
+                    tag_contains = (qs.get("tag_contains", [None])[0] or None)
+
+                    where = {}
+                    if kind:
+                        where["kind"] = kind
+                    if tag_contains:
+                        where["tags"] = {"$contains": tag_contains}
+
+                    items = []
+                    if q:
+                        items = search_memory(query=q, k=limit, where=where)
+                    else:
+                        try:
+                            from core.vector_mem import _collection
+                            res = _collection.get(limit=limit, offset=0, include=["ids","documents","metadatas"])
+                            for i in range(len(res.get("ids", []))):
+                                items.append({"id": res["ids"][i], "text": res["documents"][i], "meta": res["metadatas"][i]})
+                        except Exception as e:
+                            msg = json.dumps({"error": f"raw get failed: {type(e).__name__}: {e}"}).encode("utf-8")
+                            self._write(500, "application/json; charset=utf-8", msg)
+                            return
+
+                    body = json.dumps({"count": len(items), "items": items}).encode("utf-8")
+                    self._write(200, "application/json; charset=utf-8", body)
+                except Exception as e:
+                    msg = json.dumps({"error": f"memdump failed: {type(e).__name__}: {e}"}).encode("utf-8")
+                    self._write(500, "application/json; charset=utf-8", msg)
+            elif self.path in ("/", "/index.html"):
+                html_doc = f"""<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Simple Email Assistant</title></head>
+  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem;">
+    <h1>Simple Email Assistant</h1>
+    <p>Status: <strong>running</strong></p>
+    <ul>
+      <li>Dry run: <code>{DRY_RUN}</code></li>
+      <li>Total replied: <code>{STATE.total_replied}</code></li>
+      <li>Processed cache: <code>{len(STATE.seen)}</code></li>
+      <li>Health: <a href="/health">/health</a></li>
+      <li>Mem stats: <a href="/memstats">/memstats</a></li>
+      <li>Mem dump: <a href="/memdump">/memdump</a></li>
+    </ul>
+  </body>
+</html>"""
+                self._write(200, "text/html; charset=utf-8", html_doc.encode("utf-8"))
+            else:
+                self._write(404, "text/plain; charset=utf-8", b"Not Found\n")
+        def log_message(self, fmt, *args): pass
+
+    class QuietTCPServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    global _httpd
+    _httpd = QuietTCPServer(("0.0.0.0", HEALTH_PORT), Handler)
+    t = threading.Thread(target=_httpd.serve_forever, daemon=True)
+    t.start()
+    log(f"[health] listening on :{HEALTH_PORT}")
+
+def stop_health_server():
+    global _httpd
+    if _httpd is not None:
+        try:
+            _httpd.shutdown()
+            _httpd.server_close()
+        except Exception:
+            pass
+        _httpd = None
+
+# -------- Main worker loop ----------
+def _sender_allowed(m: Dict[str, Any]) -> bool:
+    if not (ALLOWLIST_EMAILS or ALLOWLIST_DOMAINS):
+        return True
+    sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+    if sender in ALLOWLIST_EMAILS:
+        return True
+    dom = sender.split("@")[-1] if "@" in sender else ""
+    return dom in ALLOWLIST_DOMAINS
+
+def run_worker_loop():
+    import traceback
+    token = None
+    while not _STOP:
+        try:
+            token = get_token()
+            msgs = list_unread_messages(token)
+            if msgs:
+                log(f"Found {len(msgs)} unread message(s).")
+
+            for m in msgs or []:
+                if not _sender_allowed(m):
+                    # leave unread; skip completely
+                    continue
+
+                # Try TEACH flow first
+                try:
+                    if maybe_handle_teach(m, token):
+                        continue
+                except Exception as e:
+                    log(f"[ERROR] teach handler failed: {type(e).__name__}: {e}")
+                    try: mark_read(m["id"], token)
+                    except Exception: pass
+                    continue
+
+                # Normal answer flow
+                try:
+                    prompt = build_prompt_with_memory(m)
+                    ans_text = ask_chatgpt(prompt) or ""
+                    final_html = _append_signature_html(ans_text)
+
+                    if not DRY_RUN:
+                        reply_in_thread(m["id"], final_html, token, reply_all=True)
+                        mark_read(m["id"], token)
+
+                    STATE.total_replied += 1
+                    STATE.seen.add(m["id"])
+                    STATE.save()
+
+                    sender_addr = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "?")
+                    log(f"Replied to {sender_addr} msg_id={m.get('id')}")
+                except Exception as e:
+                    STATE.last_error = f"{type(e).__name__}: {e}"
+                    STATE.save()
+                    log(f"[ERROR] {STATE.last_error}\n{traceback.format_exc()}")
+
+        except Exception as e:
+            import traceback as _tb
+            STATE.last_error = f"top loop: {type(e).__name__}: {e}"
+            STATE.save()
+            log(f"[ERROR] {STATE.last_error}\n{_tb.format_exc()}")
+
+        # Sleep with fast shutdown responsiveness
+        for _ in range(POLL_SECONDS):
+            if _STOP: break
+            time.sleep(1)
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    print("[boot] starting health server...", flush=True)
+    start_health_server()
+    print("[boot] health server started", flush=True)
+
+    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} Email assistant started. poll={POLL_SECONDS}s dry_run={int(DRY_RUN)}", flush=True)
+    run_worker_loop()
+    print("Shutting down. Bye.", flush=True)

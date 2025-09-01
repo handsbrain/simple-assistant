@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# venv
+.venv/
+
+# App state / vector DB / caches
+state/
+state/**
+
+# Local env files (never commit secrets)
+.env
+.env.*
+!.env.example   # keep a template only
+
+# Logs
+*.log
+tips.txt
