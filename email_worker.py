@@ -386,7 +386,8 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
 def list_attachments(msg_id: str, token: str) -> List[Dict[str, Any]]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments"
-        params = {"$select": "id,name,contentType,size,isInline,@odata.type", "$top": str(ATTACH_MAX_COUNT)}
+        # Let Graph return default fields (including @odata.type); just cap results
+        params = {"$top": str(ATTACH_MAX_COUNT)}
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"attachments: {r.status_code} {r.text}")
@@ -395,7 +396,7 @@ def list_attachments(msg_id: str, token: str) -> List[Dict[str, Any]]:
         out = []
         for a in items:
             otype = a.get("@odata.type", "")
-            if "fileAttachment" in otype:
+            if ("fileAttachment" in otype) or (otype == ""):
                 out.append(a)
         log(f"[attach] found {len(out)} file attachments out of {len(items)} total")
         return out
@@ -414,7 +415,26 @@ def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, An
             data = base64.b64decode(b64) if b64 else b""
         except Exception:
             data = b""
-        return {"name": j.get("name",""), "contentType": j.get("contentType",""), "size": int(j.get("size") or 0), "bytes": data}
+        size = int(j.get("size") or 0)
+        # Fallback: if no inline contentBytes, download raw via $value (cap by ATTACH_MAX_MB)
+        if (not data) and size > 0:
+            val_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments/{att_id}/$value"
+            rv = _http.get(val_url, headers=_auth(token), timeout=60, stream=True)
+            if rv.status_code >= 400:
+                raise RuntimeError(f"attach_value: {rv.status_code} {rv.text}")
+            limit = ATTACH_MAX_MB * 1024 * 1024
+            buf = bytearray()
+            read = 0
+            for chunk in rv.iter_content(65536):
+                if not chunk:
+                    break
+                read += len(chunk)
+                if read > limit:
+                    # stop reading beyond limit
+                    break
+                buf.extend(chunk)
+            data = bytes(buf)
+        return {"name": j.get("name",""), "contentType": j.get("contentType",""), "size": size, "bytes": data}
     return _retry_with_backoff(_make_request)
 
 def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
