@@ -595,9 +595,13 @@ def start_health_server():
                     else:
                         try:
                             from core.vector_mem import _collection
-                            res = _collection.get(limit=limit, offset=0, include=["ids","documents","metadatas"])
-                            for i in range(len(res.get("ids", []))):
-                                items.append({"id": res["ids"][i], "text": res["documents"][i], "meta": res["metadatas"][i]})
+                            # 'ids' is always returned; include controls optional fields
+                            res = _collection.get(limit=limit, offset=0, include=["documents","metadatas"])
+                            ids = res.get("ids", []) or []
+                            docs = res.get("documents", []) or []
+                            metas = res.get("metadatas", []) or []
+                            for i in range(len(ids)):
+                                items.append({"id": ids[i], "text": (docs[i] if i < len(docs) else ""), "meta": (metas[i] if i < len(metas) else {})})
                         except Exception as e:
                             msg = json.dumps({"error": f"raw get failed: {type(e).__name__}: {e}"}).encode("utf-8")
                             self._write(500, "application/json; charset=utf-8", msg)
