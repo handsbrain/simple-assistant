@@ -440,12 +440,27 @@ def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, An
 def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
-        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body"}
+        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body,conversationId"}
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"fetch_message: {r.status_code} {r.text}")
         return r.json()
     
+    return _retry_with_backoff(_make_request)
+
+def list_messages_in_conversation(conversation_id: str, token: str, top: int = 10) -> List[Dict[str, Any]]:
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages"
+        params = {
+            "$filter": f"conversationId eq '{conversation_id}'",
+            "$orderby": "receivedDateTime desc",
+            "$top": str(int(top)),
+            "$select": "id,receivedDateTime,hasAttachments"
+        }
+        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"list_conv: {r.status_code} {r.text}")
+        return r.json().get("value", [])
     return _retry_with_backoff(_make_request)
 
 def mark_read(msg_id: str, token: str) -> None:
@@ -579,7 +594,17 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
     if ATTACH_ENABLE:
         try:
             token = get_token()
+            # Collect attachments from the current message and, if empty, from recent messages in the same conversation
             atts = list_attachments(message.get("id"), token)
+            if not atts:
+                try:
+                    conv_id = (message.get("conversationId") or "")
+                except Exception:
+                    conv_id = ""
+                if conv_id:
+                    for mm in list_messages_in_conversation(conv_id, token, top=5):
+                        for a in list_attachments(mm.get("id"), token):
+                            atts.append(a)
             pieces = []
             total = 0
             for a in atts[:ATTACH_MAX_COUNT]:
@@ -683,9 +708,19 @@ def maybe_handle_teach(m, token) -> bool:
             log(f"[WARN] failed to save TEACH body: {type(e).__name__}: {e}")
 
     # Save attachments if enabled
-    if ATTACH_ENABLE and (m.get("hasAttachments") or True):
+    if ATTACH_ENABLE:
         try:
             atts = list_attachments(m["id"], token)
+            if not atts:
+                # Scan recent messages in the same conversation for attachments
+                try:
+                    conv_id = (m.get("conversationId") or "")
+                except Exception:
+                    conv_id = ""
+                if conv_id:
+                    for mm in list_messages_in_conversation(conv_id, token, top=5):
+                        for a in list_attachments(mm.get("id"), token):
+                            atts.append(a)
             count = 0
             for a in atts[:ATTACH_MAX_COUNT]:
                 name = a.get("name") or "attachment"
