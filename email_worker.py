@@ -106,6 +106,13 @@ def _load_signature() -> str:
                 return p.read_text(encoding="utf-8")
             except Exception:
                 pass
+    # Fallback to local repository file 'signature.txt' if present
+    try:
+        local_sig = (Path(__file__).parent / "signature.txt").resolve()
+        if local_sig.exists():
+            return local_sig.read_text(encoding="utf-8")
+    except Exception:
+        pass
     return SIGNATURE_ENV or ""
 
 SIGNATURE_RAW = _load_signature().strip()
@@ -313,7 +320,15 @@ def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=Tru
     
     def _patch_draft(draft_id: str):
         patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
-        payload = {"body": {"contentType": "HTML", "content": html_body or ""}}
+        # Fetch draft to capture quoted history content
+        get_url = patch_url + "?$select=body"
+        gr = _http.get(get_url, headers=_auth(token), timeout=30)
+        if gr.status_code >= 400:
+            raise RuntimeError(f"reply_fetch_draft: {gr.status_code} {gr.text}")
+        existing_html = (((gr.json() or {}).get("body") or {}).get("content") or "")
+        # Prepend our reply above the existing quoted thread
+        combined_html = f"<div>{html_body or ''}</div>" + (f"<br>{existing_html}" if existing_html else "")
+        payload = {"body": {"contentType": "HTML", "content": combined_html}}
         r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"reply_patch: {r.status_code} {r.text}")
