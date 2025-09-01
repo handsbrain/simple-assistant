@@ -42,6 +42,37 @@ def html_to_text(s: str) -> str:
     s = re.sub(r"(?is)<.*?>", "", s)
     return html.unescape(s)
 
+def validate_email_content(content: str, max_length: int = 100000) -> str:
+    """Validate and sanitize email content."""
+    if not content:
+        return ""
+    
+    # Check length
+    if len(content) > max_length:
+        log(f"[WARNING] Email content truncated from {len(content)} to {max_length} characters")
+        content = content[:max_length]
+    
+    # Remove potential prompt injection attempts
+    content = re.sub(r'(?i)(ignore|forget|disregard)\s+(previous|all|above)\s+(instructions?|prompts?|rules?)', '', content)
+    content = re.sub(r'(?i)(you\s+are\s+now|act\s+as|pretend\s+to\s+be)', '', content)
+    
+    return content.strip()
+
+def validate_sender(sender_info: Dict[str, Any]) -> bool:
+    """Validate sender information."""
+    if not sender_info:
+        return False
+    
+    email_address = sender_info.get("emailAddress", {}).get("address", "")
+    if not email_address or "@" not in email_address:
+        return False
+    
+    # Basic email format validation
+    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email_address):
+        return False
+    
+    return True
+
 def _strip_subject_lines(s: str) -> str:
     # Remove any leading "Subject:" line the model might generate
     lines = (s or "").splitlines()
@@ -103,6 +134,8 @@ def _append_signature_html(body_text: str) -> str:
 # -------- Microsoft Graph (Application permissions) ----------
 # Env required: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_USER_ID
 import requests
+import time
+from typing import Optional, Tuple
 
 MS_TENANT_ID    = os.getenv("MS_TENANT_ID", "")
 MS_CLIENT_ID    = os.getenv("MS_CLIENT_ID", "")
@@ -115,6 +148,15 @@ GRAPH_BASE      = "https://graph.microsoft.com/v1.0"
 _http = requests.Session()
 _http.headers.update({"Accept": "application/json"})
 
+# Token cache with expiration
+_token_cache: Optional[Tuple[str, float]] = None  # (token, expires_at)
+TOKEN_BUFFER_SECONDS = 300  # Refresh token 5 minutes before expiration
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 1  # Base delay in seconds for exponential backoff
+RATE_LIMIT_DELAY = 60  # Delay when hitting rate limits
+
 def _require_env():
     missing = [k for k, v in {
         "MS_TENANT_ID": MS_TENANT_ID,
@@ -125,7 +167,60 @@ def _require_env():
     if missing:
         raise RuntimeError(f"Missing required env: {', '.join(missing)}")
 
+def _retry_with_backoff(func, *args, **kwargs):
+    """Retry a function with exponential backoff and rate limit handling."""
+    last_exception = None
+    
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None
+            
+            # Handle rate limiting
+            if status_code == 429:
+                log(f"Rate limited, waiting {RATE_LIMIT_DELAY}s before retry {attempt + 1}/{MAX_RETRIES}")
+                time.sleep(RATE_LIMIT_DELAY)
+                continue
+            
+            # Handle server errors (5xx) and some client errors (4xx)
+            if status_code and (status_code >= 500 or status_code in [408, 429]):
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_DELAY_BASE * (2 ** attempt)  # Exponential backoff
+                    log(f"API error {status_code}, retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(delay)
+                    continue
+            
+            # Don't retry on other errors
+            raise e
+            
+        except Exception as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_BASE * (2 ** attempt)
+                log(f"Unexpected error: {type(e).__name__}: {e}, retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(delay)
+                continue
+            raise e
+    
+    # If we get here, all retries failed
+    raise last_exception
+
 def get_token() -> str:
+    """Get a valid access token, using cache if available and not expired."""
+    global _token_cache
+    
+    # Check if we have a valid cached token
+    if _token_cache is not None:
+        token, expires_at = _token_cache
+        current_time = time.time()
+        if current_time < (expires_at - TOKEN_BUFFER_SECONDS):
+            return token
+        else:
+            log(f"Token expires in {expires_at - current_time:.0f}s, refreshing...")
+    
+    # Get new token
     _require_env()
     data = {
         "client_id": MS_CLIENT_ID,
@@ -133,44 +228,69 @@ def get_token() -> str:
         "scope": "https://graph.microsoft.com/.default",
         "grant_type": "client_credentials",
     }
-    r = _http.post(GRAPH_TOKEN_URL, data=data, timeout=20)
-    if r.status_code >= 400:
-        raise RuntimeError(f"token: {r.status_code} {r.text}")
-    tok = r.json().get("access_token")
-    if not tok:
-        raise RuntimeError("token: missing access_token")
-    return tok
+    
+    try:
+        r = _http.post(GRAPH_TOKEN_URL, data=data, timeout=20)
+        if r.status_code >= 400:
+            raise RuntimeError(f"token: {r.status_code} {r.text}")
+        
+        response_data = r.json()
+        token = response_data.get("access_token")
+        if not token:
+            raise RuntimeError("token: missing access_token")
+        
+        # Cache the token with expiration time
+        expires_in = response_data.get("expires_in", 3600)  # Default to 1 hour
+        expires_at = time.time() + expires_in
+        _token_cache = (token, expires_at)
+        
+        log(f"New token obtained, expires in {expires_in}s")
+        return token
+        
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"token request failed: {type(e).__name__}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"token error: {type(e).__name__}: {e}")
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 def list_unread_messages(token: str) -> List[Dict[str, Any]]:
-    url = f"{GRAPH_BASE}/users/{MS_USER_ID}/mailFolders/Inbox/messages"
-    params = {
-        "$filter": "isRead eq false",
-        "$orderby": "receivedDateTime desc",
-        "$top": "10",
-        "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments",
-    }
-    r = _http.get(url, headers=_auth(token), params=params, timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"list_unread: {r.status_code} {r.text}")
-    return r.json().get("value", [])
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/mailFolders/Inbox/messages"
+        params = {
+            "$filter": "isRead eq false",
+            "$orderby": "receivedDateTime desc",
+            "$top": "10",
+            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments",
+        }
+        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"list_unread: {r.status_code} {r.text}")
+        return r.json().get("value", [])
+    
+    return _retry_with_backoff(_make_request)
 
 def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
-    url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
-    params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body"}
-    r = _http.get(url, headers=_auth(token), params=params, timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"fetch_message: {r.status_code} {r.text}")
-    return r.json()
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
+        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body"}
+        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"fetch_message: {r.status_code} {r.text}")
+        return r.json()
+    
+    return _retry_with_backoff(_make_request)
 
 def mark_read(msg_id: str, token: str) -> None:
-    url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
-    payload = {"isRead": True}
-    r = _http.patch(url, headers=_auth(token), json=payload, timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"mark_read: {r.status_code} {r.text}")
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
+        payload = {"isRead": True}
+        r = _http.patch(url, headers=_auth(token), json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"mark_read: {r.status_code} {r.text}")
+    
+    _retry_with_backoff(_make_request)
 
 def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=True) -> None:
     """
@@ -179,31 +299,35 @@ def reply_in_thread(msg_id: str, html_body: str, token: str, reply_all: bool=Tru
       PATCH  /users/{id}/messages/{draft_id}   (body.contentType='HTML', body.content=html)
       POST   /users/{id}/messages/{draft_id}/send
     """
-    base = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
-    # 1) Create reply draft
-    create_url = base + ("/createReplyAll" if reply_all else "/createReply")
-    r = _http.post(create_url, headers=_auth(token), timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"reply_create: {r.status_code} {r.text}")
-    draft = r.json() or {}
+    def _create_reply():
+        base = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
+        create_url = base + ("/createReplyAll" if reply_all else "/createReply")
+        r = _http.post(create_url, headers=_auth(token), timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"reply_create: {r.status_code} {r.text}")
+        return r.json() or {}
+    
+    def _patch_draft(draft_id: str):
+        patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
+        payload = {"body": {"contentType": "HTML", "content": html_body or ""}}
+        r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"reply_patch: {r.status_code} {r.text}")
+    
+    def _send_draft(draft_id: str):
+        send_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}/send"
+        r = _http.post(send_url, headers=_auth(token), timeout=30)
+        if r.status_code not in (202, 204):
+            raise RuntimeError(f"reply_send: {r.status_code} {r.text}")
+    
+    # Execute the three-step process with retry logic
+    draft = _retry_with_backoff(_create_reply)
     draft_id = draft.get("id")
     if not draft_id:
-        # Some Graph responses omit body; fetch the most recent draft in thread (fallback)
         raise RuntimeError("reply_create: missing draft id in response")
-
-    # 2) Patch HTML body
-    patch_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}"
-    payload = {"body": {"contentType": "HTML", "content": html_body or ""}}
-    r = _http.patch(patch_url, headers=_auth(token), json=payload, timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"reply_patch: {r.status_code} {r.text}")
-
-    # 3) Send
-    send_url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{draft_id}/send"
-    r = _http.post(send_url, headers=_auth(token), timeout=30)
-    if r.status_code not in (202, 204):
-        # Graph sometimes returns 202/204 on success
-        raise RuntimeError(f"reply_send: {r.status_code} {r.text}")
+    
+    _retry_with_backoff(_patch_draft, draft_id)
+    _retry_with_backoff(_send_draft, draft_id)
 
 # -------- State (de-dupe) ----------
 class State:
@@ -226,25 +350,56 @@ class State:
 
     def save(self):
         try:
-            self.path.write_text(json.dumps({
+            # Create backup of existing state
+            if self.path.exists():
+                backup_path = self.path.with_suffix('.json.backup')
+                self.path.rename(backup_path)
+            
+            # Write new state
+            state_data = {
                 "seen": sorted(self.seen),
                 "total_replied": self.total_replied,
                 "last_error": self.last_error,
-            }))
-        except Exception:
-            pass
+                "last_saved": datetime.now(timezone.utc).isoformat(),
+            }
+            self.path.write_text(json.dumps(state_data, indent=2))
+            
+            # Remove backup on success
+            backup_path = self.path.with_suffix('.json.backup')
+            if backup_path.exists():
+                backup_path.unlink()
+                
+        except Exception as e:
+            log(f"[ERROR] Failed to save state: {type(e).__name__}: {e}")
+            # Try to restore backup if it exists
+            backup_path = self.path.with_suffix('.json.backup')
+            if backup_path.exists():
+                try:
+                    backup_path.rename(self.path)
+                    log("Restored state from backup")
+                except Exception as restore_e:
+                    log(f"[ERROR] Failed to restore backup: {type(restore_e).__name__}: {restore_e}")
+            raise
 
 STATE = State(STATE_PATH)
 
 # -------- Prompt builder ----------
 def build_prompt_with_memory(message: Dict[str, Any]) -> str:
+    # Validate sender
+    if not validate_sender(message.get("from", {})):
+        raise ValueError("Invalid sender information")
+    
     sender = (((message.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
-    subject = (message.get("subject") or "").strip()
+    subject = validate_email_content((message.get("subject") or "").strip())
     body_html = (message.get("body") or {}).get("content") or ""
+    
     if (message.get("body") or {}).get("contentType","").lower() == "html":
         body = html_to_text(body_html)
     else:
         body = body_html or (message.get("bodyPreview") or "")
+    
+    # Validate and sanitize body content
+    body = validate_email_content(body)
 
     # semantic pulls with light filters
     snippets = []
@@ -345,16 +500,45 @@ def start_health_server():
 
         def do_GET(self):
             if self.path == "/health":
+                # Check external dependencies
+                health_status = "ok"
+                issues = []
+                
+                # Check if we can get a token
+                try:
+                    test_token = get_token()
+                    if not test_token:
+                        health_status = "degraded"
+                        issues.append("token_retrieval_failed")
+                except Exception as e:
+                    health_status = "degraded"
+                    issues.append(f"token_error: {type(e).__name__}")
+                
+                # Check memory system
+                try:
+                    if _HAS_MEM:
+                        search_memory("test", k=1)
+                    else:
+                        health_status = "degraded"
+                        issues.append("memory_system_unavailable")
+                except Exception as e:
+                    health_status = "degraded"
+                    issues.append(f"memory_error: {type(e).__name__}")
+                
                 body = json.dumps({
-                    "status": "ok",
+                    "status": health_status,
                     "now": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "dry_run": DRY_RUN,
                     "total_replied": STATE.total_replied,
                     "processed_cache": len(STATE.seen),
                     "last_error": STATE.last_error,
                     "poll_seconds": POLL_SECONDS,
+                    "issues": issues,
+                    "uptime_seconds": int(time.time() - _start_time) if '_start_time' in globals() else 0,
                 }).encode("utf-8")
-                self._write(200, "application/json; charset=utf-8", body)
+                
+                status_code = 200 if health_status == "ok" else 503
+                self._write(status_code, "application/json; charset=utf-8", body)
             elif self.path == "/memstats":
                 if _HAS_MEM and callable(mem_all_stats):
                     try:
@@ -457,6 +641,12 @@ def _sender_allowed(m: Dict[str, Any]) -> bool:
     dom = sender.split("@")[-1] if "@" in sender else ""
     return dom in ALLOWLIST_DOMAINS
 
+def _is_self_email(m: Dict[str, Any]) -> bool:
+    """Check if the email is from the assistant itself to prevent loops."""
+    sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+    # Check if sender matches the target mailbox
+    return sender == MS_USER_ID.lower() or sender == f"noreply@{MS_USER_ID.split('@')[-1] if '@' in MS_USER_ID else ''}"
+
 def run_worker_loop():
     import traceback
     token = None
@@ -471,6 +661,15 @@ def run_worker_loop():
                 if not _sender_allowed(m):
                     # leave unread; skip completely
                     continue
+                
+                # Prevent email loops
+                if _is_self_email(m):
+                    log(f"Skipping self-email from {(((m.get('from') or {}).get('emailAddress') or {}).get('address') or '?')}")
+                    try:
+                        mark_read(m["id"], token)
+                    except Exception as mark_e:
+                        log(f"[ERROR] Failed to mark self-email as read: {type(mark_e).__name__}: {mark_e}")
+                    continue
 
                 # Try TEACH flow first
                 try:
@@ -478,8 +677,10 @@ def run_worker_loop():
                         continue
                 except Exception as e:
                     log(f"[ERROR] teach handler failed: {type(e).__name__}: {e}")
-                    try: mark_read(m["id"], token)
-                    except Exception: pass
+                    try: 
+                        mark_read(m["id"], token)
+                    except Exception as mark_e:
+                        log(f"[ERROR] Failed to mark message as read: {type(mark_e).__name__}: {mark_e}")
                     continue
 
                 # Normal answer flow
@@ -517,6 +718,10 @@ def run_worker_loop():
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
+
+    # Track startup time for health monitoring
+    global _start_time
+    _start_time = time.time()
 
     print("[boot] starting health server...", flush=True)
     start_health_server()

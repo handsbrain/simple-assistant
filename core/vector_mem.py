@@ -56,24 +56,42 @@ def add_memory(
     text = (text or "").strip()
     if not text:
         raise ValueError("empty memory text")
+    
+    # Validate input
+    if len(text) > 10000:  # Reasonable limit for memory content
+        raise ValueError("memory text too long (max 10000 characters)")
+    
+    if kind not in ["rule", "example", "note"]:
+        raise ValueError(f"invalid kind: {kind}")
+    
+    if tags and len(tags) > 20:
+        raise ValueError("too many tags (max 20)")
+    
+    # Sanitize tags
+    if tags:
+        tags = [tag.strip()[:50] for tag in tags if tag.strip()]  # Limit tag length
+    
     # IMPORTANT: Chroma 0.5.x allows only primitive metadata; lists are not allowed.
     tag_str = ",".join(tags) if tags else ""
     meta = {
         "kind": str(kind or "rule"),
         "tags": tag_str,
-        "author": (author or "").lower(),
-        "source": source or "",
+        "author": (author or "").lower()[:100],  # Limit author length
+        "source": (source or "")[:100],  # Limit source length
     }
     
-    vid = _stable_id(text, meta)
-    vec = _embed([text])[0]
-    _collection.add(
-        ids=[vid],
-        embeddings=[vec],
-        documents=[text],
-        metadatas=[meta],
-    )
-    return vid
+    try:
+        vid = _stable_id(text, meta)
+        vec = _embed([text])[0]
+        _collection.add(
+            ids=[vid],
+            embeddings=[vec],
+            documents=[text],
+            metadatas=[meta],
+        )
+        return vid
+    except Exception as e:
+        raise RuntimeError(f"Failed to add memory: {type(e).__name__}: {e}")
 
 def search_memory(
     query: str,
