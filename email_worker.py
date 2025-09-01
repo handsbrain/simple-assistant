@@ -1,6 +1,6 @@
 # email_worker.py
 from __future__ import annotations
-import os, sys, time, json, signal, threading, re, html, random
+import os, sys, time, json, signal, threading, re, html, random, base64
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -33,6 +33,13 @@ ALLOWLIST_DOMAINS = {a.split("@",1)[1] for a in _raw_allow if "@" in a} | {a for
 STATE_DIR   = Path(os.getenv("STATE_DIR", "state"))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH  = STATE_DIR / "processed.json"
+
+# -------- Attachments config ----------
+ATTACH_ENABLE     = os.getenv("ATTACH_ENABLE", "1").lower() in ("1","true","yes","y")
+ATTACH_MAX_COUNT  = int(os.getenv("ATTACH_MAX_COUNT", "50"))
+ATTACH_MAX_MB     = int(os.getenv("ATTACH_MAX_MB", "30"))
+ATTACH_EXTS       = {e.strip().lower() for e in (os.getenv("ATTACH_EXTS", "pdf,docx,pptx,xlsx,txt,csv").split(",")) if e.strip()}
+ATTACH_SUMMARY_MAX_CHARS = int(os.getenv("ATTACH_SUMMARY_MAX_CHARS", "2000"))
 
 # -------- Utilities ----------
 def html_to_text(s: str) -> str:
@@ -96,6 +103,67 @@ def _text_to_html(s: str) -> str:
     s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
     esc = html.escape(s, quote=False)
     return esc.replace("\n", "<br>")
+
+def _file_ext(name: str, ctype: str) -> str:
+    n = (name or "").lower().strip()
+    if "." in n:
+        return n.rsplit(".", 1)[-1]
+    if "/" in (ctype or ""):
+        return ctype.split("/")[-1].lower()
+    return ""
+
+def _safe_decode_text(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except Exception:
+        return data.decode("latin-1", errors="ignore")
+
+def _extract_text_from_attachment(name: str, content_type: str, data: bytes) -> str:
+    if not data:
+        return ""
+    if len(data) > ATTACH_MAX_MB * 1024 * 1024:
+        return ""
+    ext = _file_ext(name, content_type)
+    try:
+        if ext == "pdf":
+            import io
+            from pypdf import PdfReader
+            r = PdfReader(io.BytesIO(data))
+            return "\n".join((p.extract_text() or "") for p in r.pages)
+        if ext == "docx":
+            import io
+            from docx import Document
+            d = Document(io.BytesIO(data))
+            return "\n".join(p.text for p in d.paragraphs if p.text)
+        if ext == "pptx":
+            import io
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(data))
+            out = []
+            for slide in prs.slides:
+                for shp in slide.shapes:
+                    if hasattr(shp, "text") and shp.text:
+                        out.append(shp.text)
+            return "\n".join(out)
+        if ext in ("xlsx", "xlsm"):
+            import io, openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+            out = []
+            for ws in wb.worksheets:
+                out.append(f"# Sheet: {ws.title}")
+                rows = 0
+                for row in ws.iter_rows(values_only=True):
+                    out.append(" | ".join("" if v is None else str(v) for v in row))
+                    rows += 1
+                    if rows >= 2000:
+                        break
+            return "\n".join(out)
+        if ext in ("csv", "txt", "json", "md"):
+            return _safe_decode_text(data)
+        # Unsupported → skip (images/others)
+        return ""
+    except Exception:
+        return ""
 
 def _load_signature() -> str:
     # Prefer file if provided; else env
@@ -282,6 +350,32 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
     
     return _retry_with_backoff(_make_request)
 
+def list_attachments(msg_id: str, token: str) -> List[Dict[str, Any]]:
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments"
+        params = {"$select": "id,name,contentType,size,isInline,@odata.type", "$top": str(ATTACH_MAX_COUNT)}
+        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"attachments: {r.status_code} {r.text}")
+        return r.json().get("value", [])
+    return _retry_with_backoff(_make_request)
+
+def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, Any]:
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments/{att_id}"
+        params = {"$select": "name,contentType,size,contentBytes"}
+        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"attach_get: {r.status_code} {r.text}")
+        j = r.json() or {}
+        b64 = j.get("contentBytes") or ""
+        try:
+            data = base64.b64decode(b64) if b64 else b""
+        except Exception:
+            data = b""
+        return {"name": j.get("name",""), "contentType": j.get("contentType",""), "size": int(j.get("size") or 0), "bytes": data}
+    return _retry_with_backoff(_make_request)
+
 def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
@@ -420,6 +514,30 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
     # Validate and sanitize body content
     body = validate_email_content(body)
 
+    # Attachments summary (non-TEACH path): include short snippets to help the model
+    attach_block = ""
+    if ATTACH_ENABLE and (message.get("hasAttachments") or False):
+        try:
+            token = get_token()
+            atts = list_attachments(message.get("id"), token)
+            pieces = []
+            total = 0
+            for a in atts[:ATTACH_MAX_COUNT]:
+                if a.get("isInline"): continue
+                det = fetch_attachment_bytes(message.get("id"), a.get("id"), token)
+                snippet = _extract_text_from_attachment(det.get("name",""), det.get("contentType",""), det.get("bytes", b""))
+                if not snippet: continue
+                snippet = snippet.strip().replace("\r\n","\n")
+                if len(snippet) > 400: snippet = snippet[:400] + "…"
+                entry = f"- {a.get('name','attachment')}: {snippet}"
+                pieces.append(entry)
+                total += len(entry)
+                if total >= ATTACH_SUMMARY_MAX_CHARS: break
+            if pieces:
+                attach_block = "Attachments:\n" + "\n".join(pieces) + "\n\n"
+        except Exception as e:
+            log(f"[WARN] attachment summary failed: {type(e).__name__}: {e}")
+
     # semantic pulls with light filters
     snippets = []
     try:
@@ -445,7 +563,7 @@ Guidelines:
 - Do NOT include a full signature block; I'll append mine automatically.
 - Keep it professional and brief unless the sender explicitly asks for detail.
 
-{memory_block}Incoming email (from {sender}) — SUBJECT: {subject}
+{memory_block}{attach_block}Incoming email (from {sender}) — SUBJECT: {subject}
 
 Email body:
 {body}
@@ -479,18 +597,51 @@ def maybe_handle_teach(m, token) -> bool:
             parsed_text = L.split(":",1)[1].strip()
 
     text_to_store = parsed_text or body.strip()
-    if not text_to_store:
+    if not text_to_store and not (ATTACH_ENABLE and (m.get("hasAttachments") or False)):
         reply_in_thread(m["id"], _append_signature_html("I didn't find any content to learn."), token)
         mark_read(m["id"], token)
         return True
 
-    try:
-        add_memory(text=text_to_store, kind=kind, tags=tags, author=sender, source="email")
+    saved_any = False
+    # Save body text if present
+    if text_to_store:
+        try:
+            add_memory(text=text_to_store, kind=kind, tags=tags, author=sender, source="email")
+            saved_any = True
+        except Exception as e:
+            log(f"[WARN] failed to save TEACH body: {type(e).__name__}: {e}")
+
+    # Save attachments if enabled
+    if ATTACH_ENABLE and (m.get("hasAttachments") or False):
+        try:
+            atts = list_attachments(m["id"], token)
+            count = 0
+            for a in atts[:ATTACH_MAX_COUNT]:
+                if a.get("isInline"):
+                    continue
+                name = a.get("name") or "attachment"
+                ctype = a.get("contentType") or ""
+                ext = _file_ext(name, ctype)
+                if ATTACH_EXTS and ext not in ATTACH_EXTS:
+                    continue
+                det = fetch_attachment_bytes(m["id"], a.get("id"), token)
+                txt = _extract_text_from_attachment(det.get("name", name), det.get("contentType", ctype), det.get("bytes", b""))
+                if not txt:
+                    continue
+                try:
+                    add_memory(text=txt, kind=kind, tags=(tags + ["attachment", f"file:{name}", f"ext:{ext}"]), author=sender, source="email-attachment")
+                    saved_any = True
+                    count += 1
+                except Exception as e:
+                    log(f"[WARN] failed to save attachment memory: {type(e).__name__}: {e}")
+        except Exception as e:
+            log(f"[WARN] attachment ingestion failed: {type(e).__name__}: {e}")
+
+    if saved_any:
         reply_in_thread(m["id"], _append_signature_html("Thanks — I’ve saved this to my memory."), token)
-    except Exception as e:
-        reply_in_thread(m["id"], _append_signature_html(f"Sorry — I couldn’t save this to memory: {type(e).__name__}: {e}"), token)
-    finally:
-        mark_read(m["id"], token)
+    else:
+        reply_in_thread(m["id"], _append_signature_html("Sorry — I couldn’t extract any content to save."), token)
+    mark_read(m["id"], token)
     return True
 
 # -------- Logging & signals ----------
