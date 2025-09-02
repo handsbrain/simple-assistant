@@ -125,78 +125,236 @@ def _safe_decode_text(data: bytes) -> str:
         return data.decode("latin-1", errors="ignore")
 
 def _extract_text_from_attachment(name: str, content_type: str, data: bytes) -> str:
+    """Extract text from attachment with enhanced error handling and logging."""
     if not data:
+        log(f"[attach] No data provided for {name}")
         return ""
+    
     if len(data) > ATTACH_MAX_MB * 1024 * 1024:
+        log(f"[attach] File {name} too large: {len(data)} bytes (max: {ATTACH_MAX_MB}MB)")
         return ""
+    
     ext = _file_ext(name, content_type)
+    log(f"[attach] Processing {name} (ext: {ext}, type: {content_type}, size: {len(data)} bytes)")
+    
     try:
         if ext == "pdf":
-            import io
-            from pypdf import PdfReader
-            r = PdfReader(io.BytesIO(data))
-            pdf_text = "\n".join((p.extract_text() or "") for p in r.pages)
-            if pdf_text.strip():
-                return pdf_text
-            if ATTACH_OCR:
-                try:
-                    import io
-                    import pypdfium2 as pdfium
-                    from PIL import Image
-                    import pytesseract
-                    pdf = pdfium.PdfDocument(io.BytesIO(data))
-                    n = min(len(pdf), OCR_PAGES_MAX)
-                    out_lines = []
-                    for i in range(n):
-                        page = pdf[i]
-                        pil_img = page.render(scale=OCR_DPI / 72.0).to_pil()
-                        out_lines.append(pytesseract.image_to_string(pil_img, lang=OCR_LANG))
-                    return "\n".join(out_lines)
-                except Exception:
-                    return ""
-        if ext == "docx":
-            import io
-            from docx import Document
-            d = Document(io.BytesIO(data))
-            return "\n".join(p.text for p in d.paragraphs if p.text)
-        if ext == "pptx":
-            import io
-            from pptx import Presentation
-            prs = Presentation(io.BytesIO(data))
-            out = []
-            for slide in prs.slides:
-                for shp in slide.shapes:
-                    if hasattr(shp, "text") and shp.text:
-                        out.append(shp.text)
-            return "\n".join(out)
-        if ext in ("xlsx", "xlsm"):
-            import io, openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-            out = []
-            for ws in wb.worksheets:
-                out.append(f"# Sheet: {ws.title}")
-                rows = 0
-                for row in ws.iter_rows(values_only=True):
-                    out.append(" | ".join("" if v is None else str(v) for v in row))
-                    rows += 1
-                    if rows >= 2000:
-                        break
-            return "\n".join(out)
-        if ext in ("csv", "txt", "json", "md"):
-            return _safe_decode_text(data)
-        if ext in ("png", "jpg", "jpeg", "tiff", "bmp", "webp"):
-            if not ATTACH_OCR:
-                return ""
-            try:
-                from PIL import Image
-                import io, pytesseract
-                img = Image.open(io.BytesIO(data))
-                return pytesseract.image_to_string(img, lang=OCR_LANG)
-            except Exception:
-                return ""
+            return _extract_pdf_text(name, data)
+        elif ext == "docx":
+            return _extract_docx_text(name, data)
+        elif ext == "pptx":
+            return _extract_pptx_text(name, data)
+        elif ext in ("xlsx", "xlsm"):
+            return _extract_xlsx_text(name, data)
+        elif ext in ("csv", "txt", "json", "md"):
+            return _extract_text_file(name, data)
+        elif ext in ("png", "jpg", "jpeg", "tiff", "bmp", "webp"):
+            return _extract_image_text(name, data)
+        else:
+            log(f"[attach] Unsupported file type: {ext} for {name}")
+            return ""
+    except Exception as e:
+        log(f"[attach] Error processing {name}: {type(e).__name__}: {e}")
         return ""
-    except Exception:
+
+def _extract_pdf_text(name: str, data: bytes) -> str:
+    """Extract text from PDF with fallback to OCR."""
+    try:
+        import io
+        from pypdf import PdfReader
+        
+        r = PdfReader(io.BytesIO(data))
+        pdf_text = "\n".join((p.extract_text() or "") for p in r.pages)
+        
+        if pdf_text.strip():
+            log(f"[attach] PDF text extraction successful for {name}: {len(pdf_text)} chars")
+            return pdf_text
+        
+        # Fallback to OCR if no text found
+        if ATTACH_OCR:
+            log(f"[attach] No text found in PDF {name}, trying OCR...")
+            return _extract_pdf_ocr(name, data)
+        else:
+            log(f"[attach] No text found in PDF {name} and OCR disabled")
+            return ""
+            
+    except Exception as e:
+        log(f"[attach] PDF processing failed for {name}: {type(e).__name__}: {e}")
         return ""
+
+def _extract_pdf_ocr(name: str, data: bytes) -> str:
+    """Extract text from PDF using OCR."""
+    try:
+        import io
+        import pypdfium2 as pdfium
+        from PIL import Image
+        import pytesseract
+        
+        pdf = pdfium.PdfDocument(io.BytesIO(data))
+        n = min(len(pdf), OCR_PAGES_MAX)
+        out_lines = []
+        
+        for i in range(n):
+            page = pdf[i]
+            pil_img = page.render(scale=OCR_DPI / 72.0).to_pil()
+            text = pytesseract.image_to_string(pil_img, lang=OCR_LANG)
+            out_lines.append(text)
+            
+        result = "\n".join(out_lines)
+        log(f"[attach] PDF OCR successful for {name}: {len(result)} chars from {n} pages")
+        return result
+        
+    except Exception as e:
+        log(f"[attach] PDF OCR failed for {name}: {type(e).__name__}: {e}")
+        return ""
+
+def _extract_docx_text(name: str, data: bytes) -> str:
+    """Extract text from DOCX file."""
+    try:
+        import io
+        from docx import Document
+        
+        d = Document(io.BytesIO(data))
+        text = "\n".join(p.text for p in d.paragraphs if p.text)
+        
+        log(f"[attach] DOCX extraction successful for {name}: {len(text)} chars")
+        return text
+        
+    except Exception as e:
+        log(f"[attach] DOCX processing failed for {name}: {type(e).__name__}: {e}")
+        return ""
+
+def _extract_pptx_text(name: str, data: bytes) -> str:
+    """Extract text from PPTX file."""
+    try:
+        import io
+        from pptx import Presentation
+        
+        prs = Presentation(io.BytesIO(data))
+        out = []
+        
+        for slide in prs.slides:
+            for shp in slide.shapes:
+                if hasattr(shp, "text") and shp.text:
+                    out.append(shp.text)
+        
+        text = "\n".join(out)
+        log(f"[attach] PPTX extraction successful for {name}: {len(text)} chars")
+        return text
+        
+    except Exception as e:
+        log(f"[attach] PPTX processing failed for {name}: {type(e).__name__}: {e}")
+        return ""
+
+def _extract_xlsx_text(name: str, data: bytes) -> str:
+    """Extract text from Excel file."""
+    try:
+        import io, openpyxl
+        
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        out = []
+        
+        for ws in wb.worksheets:
+            out.append(f"# Sheet: {ws.title}")
+            rows = 0
+            for row in ws.iter_rows(values_only=True):
+                out.append(" | ".join("" if v is None else str(v) for v in row))
+                rows += 1
+                if rows >= 2000:
+                    break
+        
+        text = "\n".join(out)
+        log(f"[attach] XLSX extraction successful for {name}: {len(text)} chars")
+        return text
+        
+    except Exception as e:
+        log(f"[attach] XLSX processing failed for {name}: {type(e).__name__}: {e}")
+        return ""
+
+def _extract_text_file(name: str, data: bytes) -> str:
+    """Extract text from plain text files."""
+    try:
+        text = _safe_decode_text(data)
+        log(f"[attach] Text file extraction successful for {name}: {len(text)} chars")
+        return text
+        
+    except Exception as e:
+        log(f"[attach] Text file processing failed for {name}: {type(e).__name__}: {e}")
+        return ""
+
+def _extract_image_text(name: str, data: bytes) -> str:
+    """Extract text from image using OCR."""
+    if not ATTACH_OCR:
+        log(f"[attach] OCR disabled, skipping image {name}")
+        return ""
+        
+    try:
+        from PIL import Image
+        import io, pytesseract
+        
+        img = Image.open(io.BytesIO(data))
+        text = pytesseract.image_to_string(img, lang=OCR_LANG)
+        
+        log(f"[attach] Image OCR successful for {name}: {len(text)} chars")
+        return text
+        
+    except Exception as e:
+        log(f"[attach] Image OCR failed for {name}: {type(e).__name__}: {e}")
+        return ""
+
+def validate_attachment_processing() -> Dict[str, Any]:
+    """Validate that attachment processing dependencies are available."""
+    validation_results = {
+        "pdf_processing": False,
+        "docx_processing": False,
+        "pptx_processing": False,
+        "xlsx_processing": False,
+        "ocr_processing": False,
+        "errors": []
+    }
+    
+    # Test PDF processing
+    try:
+        import io
+        from pypdf import PdfReader
+        validation_results["pdf_processing"] = True
+    except ImportError as e:
+        validation_results["errors"].append(f"PDF processing unavailable: {e}")
+    
+    # Test DOCX processing
+    try:
+        from docx import Document
+        validation_results["docx_processing"] = True
+    except ImportError as e:
+        validation_results["errors"].append(f"DOCX processing unavailable: {e}")
+    
+    # Test PPTX processing
+    try:
+        from pptx import Presentation
+        validation_results["pptx_processing"] = True
+    except ImportError as e:
+        validation_results["errors"].append(f"PPTX processing unavailable: {e}")
+    
+    # Test XLSX processing
+    try:
+        import openpyxl
+        validation_results["xlsx_processing"] = True
+    except ImportError as e:
+        validation_results["errors"].append(f"XLSX processing unavailable: {e}")
+    
+    # Test OCR processing
+    if ATTACH_OCR:
+        try:
+            import pytesseract
+            from PIL import Image
+            import pypdfium2
+            validation_results["ocr_processing"] = True
+        except ImportError as e:
+            validation_results["errors"].append(f"OCR processing unavailable: {e}")
+    else:
+        validation_results["ocr_processing"] = "disabled"
+    
+    return validation_results
 
 def _load_signature() -> str:
     # Prefer file if provided; else env
@@ -374,7 +532,7 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
             "$filter": "isRead eq false",
             "$orderby": "receivedDateTime desc",
             "$top": "10",
-            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments",
+            "$select": "id,subject,bodyPreview,receivedDateTime,from,body,hasAttachments,conversationId",
         }
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
@@ -386,33 +544,74 @@ def list_unread_messages(token: str) -> List[Dict[str, Any]]:
 def list_attachments(msg_id: str, token: str) -> List[Dict[str, Any]]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments"
-        params = {"$select": "id,name,contentType,size,isInline,@odata.type", "$top": str(ATTACH_MAX_COUNT)}
+        params = {"$select": "id,name,contentType,size,isInline", "$top": str(ATTACH_MAX_COUNT)}
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"attachments: {r.status_code} {r.text}")
         return r.json().get("value", [])
     return _retry_with_backoff(_make_request)
 
+def list_messages_in_conversation(conversation_id: str, token: str, top: int = 5) -> List[Dict[str, Any]]:
+    """List recent messages in a conversation to find attachments."""
+    def _make_request():
+        url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages"
+        params = {
+            "$filter": f"conversationId eq '{conversation_id}'",
+            "$orderby": "receivedDateTime desc",
+            "$top": str(top),
+            "$select": "id,hasAttachments",
+        }
+        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        if r.status_code >= 400:
+            raise RuntimeError(f"conversation_messages: {r.status_code} {r.text}")
+        return r.json().get("value", [])
+    return _retry_with_backoff(_make_request)
+
 def fetch_attachment_bytes(msg_id: str, att_id: str, token: str) -> Dict[str, Any]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}/attachments/{att_id}"
-        params = {"$select": "name,contentType,size,contentBytes"}
-        r = _http.get(url, headers=_auth(token), params=params, timeout=30)
+        # Don't use $select for contentBytes as it's not always available
+        r = _http.get(url, headers=_auth(token), timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"attach_get: {r.status_code} {r.text}")
         j = r.json() or {}
         b64 = j.get("contentBytes") or ""
+        data = b""
+        source = "contentBytes"
+        
         try:
             data = base64.b64decode(b64) if b64 else b""
         except Exception:
             data = b""
-        return {"name": j.get("name",""), "contentType": j.get("contentType",""), "size": int(j.get("size") or 0), "bytes": data}
+        
+        # If no contentBytes or empty, try $value endpoint for large files
+        if not data and j.get("size", 0) > 0:
+            try:
+                rv = _http.get(f"{url}/$value", headers=_auth(token), timeout=60, stream=True)
+                if rv.status_code == 200:
+                    buf = bytearray()
+                    for chunk in rv.iter_content(65536):
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                    data = bytes(buf)
+                    source = "$value"
+            except Exception as e:
+                log(f"[WARN] $value fallback failed: {type(e).__name__}: {e}")
+        
+        return {
+            "name": j.get("name", ""),
+            "contentType": j.get("contentType", ""),
+            "size": int(j.get("size") or 0),
+            "bytes": data,
+            "source": source
+        }
     return _retry_with_backoff(_make_request)
 
 def fetch_message(msg_id: str, token: str) -> Dict[str, Any]:
     def _make_request():
         url = f"{GRAPH_BASE}/users/{MS_USER_ID}/messages/{msg_id}"
-        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body"}
+        params = {"$select": "id,subject,bodyPreview,receivedDateTime,from,body,conversationId"}
         r = _http.get(url, headers=_auth(token), params=params, timeout=30)
         if r.status_code >= 400:
             raise RuntimeError(f"fetch_message: {r.status_code} {r.text}")
@@ -552,22 +751,74 @@ def build_prompt_with_memory(message: Dict[str, Any]) -> str:
     if ATTACH_ENABLE and (message.get("hasAttachments") or False):
         try:
             token = get_token()
-            atts = list_attachments(message.get("id"), token)
+            msg_id = message.get("id")
+            log(f"[attach] processing attachments for message {msg_id}")
+            
+            # Get attachments from current message
+            atts = list_attachments(msg_id, token)
+            log(f"[attach] found {len(atts)} attachments on current message")
+            
+            # If no attachments on current message, try scanning conversation
+            if not atts and message.get("conversationId"):
+                conv_id = message.get("conversationId")
+                log(f"[attach] no attachments on current message, scanning conversation {conv_id}")
+                conv_msgs = list_messages_in_conversation(conv_id, token, top=5)
+                for conv_msg in conv_msgs:
+                    if conv_msg.get("hasAttachments"):
+                        conv_attachments = list_attachments(conv_msg.get("id"), token)
+                        # Mark the source message ID for each attachment
+                        for att in conv_attachments:
+                            att["_source_msg_id"] = conv_msg.get("id")
+                        atts.extend(conv_attachments)
+                        log(f"[attach] found {len(conv_attachments)} attachments in conversation message {conv_msg.get('id')}")
+            
             pieces = []
             total = 0
+            processed_count = 0
+            
             for a in atts[:ATTACH_MAX_COUNT]:
-                if a.get("isInline"): continue
-                det = fetch_attachment_bytes(message.get("id"), a.get("id"), token)
+                if a.get("isInline"): 
+                    log(f"[attach] skipping inline attachment: {a.get('name')}")
+                    continue
+                
+                name = a.get("name", "attachment")
+                ctype = a.get("contentType", "")
+                size = a.get("size", 0)
+                log(f"[attach] processing: {name} (type: {ctype}, size: {size})")
+                
+                # Use the correct message ID for fetching attachment data
+                attachment_msg_id = msg_id  # Default to current message
+                if a.get("_source_msg_id"):  # If attachment came from conversation scan
+                    attachment_msg_id = a.get("_source_msg_id")
+                
+                det = fetch_attachment_bytes(attachment_msg_id, a.get("id"), token)
+                log(f"[attach] fetched {len(det.get('bytes', b''))} bytes via {det.get('source', 'unknown')}")
+                
                 snippet = _extract_text_from_attachment(det.get("name",""), det.get("contentType",""), det.get("bytes", b""))
-                if not snippet: continue
+                if not snippet: 
+                    log(f"[attach] no text extracted from {name}")
+                    continue
+                
                 snippet = snippet.strip().replace("\r\n","\n")
-                if len(snippet) > 400: snippet = snippet[:400] + "…"
-                entry = f"- {a.get('name','attachment')}: {snippet}"
+                if len(snippet) > 400: 
+                    snippet = snippet[:400] + "…"
+                
+                entry = f"- {name}: {snippet}"
                 pieces.append(entry)
                 total += len(entry)
-                if total >= ATTACH_SUMMARY_MAX_CHARS: break
+                processed_count += 1
+                log(f"[attach] extracted {len(snippet)} chars from {name}")
+                
+                if total >= ATTACH_SUMMARY_MAX_CHARS: 
+                    log(f"[attach] reached character limit, stopping")
+                    break
+            
             if pieces:
                 attach_block = "Attachments:\n" + "\n".join(pieces) + "\n\n"
+                log(f"[attach] successfully processed {processed_count} attachments, total {total} chars")
+            else:
+                log(f"[attach] no text extracted from any attachments")
+                
         except Exception as e:
             log(f"[WARN] attachment summary failed: {type(e).__name__}: {e}")
 
@@ -647,26 +898,64 @@ def maybe_handle_teach(m, token) -> bool:
     # Save attachments if enabled
     if ATTACH_ENABLE and (m.get("hasAttachments") or False):
         try:
-            atts = list_attachments(m["id"], token)
+            msg_id = m["id"]
+            log(f"[teach] processing attachments for message {msg_id}")
+            
+            # Get attachments from current message
+            atts = list_attachments(msg_id, token)
+            log(f"[teach] found {len(atts)} attachments on current message")
+            
+            # If no attachments on current message, try scanning conversation
+            if not atts and m.get("conversationId"):
+                conv_id = m.get("conversationId")
+                log(f"[teach] no attachments on current message, scanning conversation {conv_id}")
+                conv_msgs = list_messages_in_conversation(conv_id, token, top=5)
+                for conv_msg in conv_msgs:
+                    if conv_msg.get("hasAttachments"):
+                        conv_attachments = list_attachments(conv_msg.get("id"), token)
+                        # Mark the source message ID for each attachment
+                        for att in conv_attachments:
+                            att["_source_msg_id"] = conv_msg.get("id")
+                        atts.extend(conv_attachments)
+                        log(f"[teach] found {len(conv_attachments)} attachments in conversation message {conv_msg.get('id')}")
+            
             count = 0
             for a in atts[:ATTACH_MAX_COUNT]:
                 if a.get("isInline"):
+                    log(f"[teach] skipping inline attachment: {a.get('name')}")
                     continue
+                
                 name = a.get("name") or "attachment"
                 ctype = a.get("contentType") or ""
                 ext = _file_ext(name, ctype)
+                
                 if ATTACH_EXTS and ext not in ATTACH_EXTS:
+                    log(f"[teach] skipping unsupported extension: {ext} for {name}")
                     continue
-                det = fetch_attachment_bytes(m["id"], a.get("id"), token)
+                
+                log(f"[teach] processing: {name} (type: {ctype}, ext: {ext})")
+                # Use the correct message ID for fetching attachment data
+                attachment_msg_id = msg_id  # Default to current message
+                if a.get("_source_msg_id"):  # If attachment came from conversation scan
+                    attachment_msg_id = a.get("_source_msg_id")
+                
+                det = fetch_attachment_bytes(attachment_msg_id, a.get("id"), token)
+                log(f"[teach] fetched {len(det.get('bytes', b''))} bytes via {det.get('source', 'unknown')}")
+                
                 txt = _extract_text_from_attachment(det.get("name", name), det.get("contentType", ctype), det.get("bytes", b""))
                 if not txt:
+                    log(f"[teach] no text extracted from {name}")
                     continue
+                
                 try:
                     add_memory(text=txt, kind=kind, tags=(tags + ["attachment", f"file:{name}", f"ext:{ext}"]), author=sender, source="email-attachment")
                     saved_any = True
                     count += 1
+                    log(f"[teach] saved {len(txt)} chars from {name} to memory")
                 except Exception as e:
                     log(f"[WARN] failed to save attachment memory: {type(e).__name__}: {e}")
+            
+            log(f"[teach] successfully processed {count} attachments")
         except Exception as e:
             log(f"[WARN] attachment ingestion failed: {type(e).__name__}: {e}")
 
@@ -727,6 +1016,16 @@ def start_health_server():
                 except Exception as e:
                     health_status = "degraded"
                     issues.append(f"memory_error: {type(e).__name__}")
+                
+                # Check attachment processing capabilities
+                try:
+                    attach_validation = validate_attachment_processing()
+                    if attach_validation["errors"]:
+                        health_status = "degraded"
+                        issues.extend([f"attach_{err}" for err in attach_validation["errors"]])
+                except Exception as e:
+                    health_status = "degraded"
+                    issues.append(f"attachment_validation_error: {type(e).__name__}")
                 
                 body = json.dumps({
                     "status": health_status,
@@ -834,7 +1133,7 @@ def start_health_server():
                     for a in atts[:ATTACH_MAX_COUNT]:
                         name = a.get("name") or "attachment"
                         ctype = a.get("contentType") or ""
-                        # Only file attachments
+                        # Only file attachments - check @odata.type if present
                         otype = a.get("@odata.type", "")
                         if otype and "fileAttachment" not in otype:
                             results.append({"name": name, "contentType": ctype, "note": "skipped non-file attachment"})
@@ -856,6 +1155,15 @@ def start_health_server():
                 except Exception as e:
                     msg = json.dumps({"error": f"attachpreview failed: {type(e).__name__}: {e}"}).encode("utf-8")
                     self._write(500, "application/json; charset=utf-8", msg)
+            elif self.path == "/attachvalidate":
+                # Validate attachment processing capabilities
+                try:
+                    validation_results = validate_attachment_processing()
+                    payload = json.dumps(validation_results).encode("utf-8")
+                    self._write(200, "application/json; charset=utf-8", payload)
+                except Exception as e:
+                    msg = json.dumps({"error": f"attachment validation failed: {type(e).__name__}: {e}"}).encode("utf-8")
+                    self._write(500, "application/json; charset=utf-8", msg)
             elif self.path in ("/", "/index.html"):
                 html_doc = f"""<!doctype html>
 <html>
@@ -870,6 +1178,7 @@ def start_health_server():
       <li>Health: <a href="/health">/health</a></li>
       <li>Mem stats: <a href="/memstats">/memstats</a></li>
       <li>Mem dump: <a href="/memdump">/memdump</a></li>
+      <li>Attachment validation: <a href="/attachvalidate">/attachvalidate</a></li>
     </ul>
   </body>
 </html>"""
